@@ -1,0 +1,139 @@
+name: NexusCloud Enterprise CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  GCP_PROJECT_ID: nexuscloud-prod
+  GKE_CLUSTER: nexuscloud-gke-cluster
+  GKE_ZONE: us-central1-a
+  GAR_LOCATION: us-central1
+  IMAGE_NAME: subscription-service
+
+jobs:
+  backend-quality-and-test:
+    name: Backend Test, Lint & Security (Java Spring Boot 3)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: nexuscloud_billing
+          POSTGRES_USER: nexus_user
+          POSTGRES_PASSWORD: nexus_secure_pass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Cache Maven Dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Run Unit & Integration Tests (TDD)
+        working-directory: src/backend-subscription-service
+        run: |
+          mvn clean test \
+            -Dspring.datasource.url=jdbc:postgresql://localhost:5432/nexuscloud_billing \
+            -Dspring.redis.host=localhost
+
+      - name: Trivy Vulnerability Scan (Filesystem)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: 'src/backend-subscription-service'
+          severity: 'CRITICAL,HIGH'
+
+  frontend-build:
+    name: Frontend Quality & Build (Next.js 15)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: 'src/frontend-nextjs/package.json'
+
+      - name: Install Frontend Dependencies
+        working-directory: src/frontend-nextjs
+        run: npm ci
+
+      - name: Next.js Type Check & Build
+        working-directory: src/frontend-nextjs
+        run: npm run build
+
+  build-and-deploy-gcp:
+    name: Build Docker & Deploy to GCP GKE
+    needs: [ backend-quality-and-test, frontend-build ]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/123456789/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: 'github-actions-deployer@nexuscloud-prod.iam.gserviceaccount.com'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ env.GAR_LOCATION }}-docker.pkg.dev
+
+      - name: Build & Push Docker Image
+        run: |
+          IMAGE_URI="${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/nexus-repo/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          docker build -t $IMAGE_URI -f src/backend-subscription-service/Dockerfile src/backend-subscription-service
+          docker push $IMAGE_URI
+
+      - name: Deploy to Google Kubernetes Engine (GKE)
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          location: ${{ env.GKE_ZONE }}
+
+      - name: Apply Kubernetes Manifests & Rollout
+        run: |
+          kubectl apply -f src/k8s-gcp/deployment.yaml
+          kubectl apply -f src/k8s-gcp/service-ingress-hpa.yaml
+          kubectl rollout status deployment/nexus-subscription-service -n production --timeout=180s
